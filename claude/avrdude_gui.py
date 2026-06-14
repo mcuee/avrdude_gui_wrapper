@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
 """
-avrdude GUI
-===========
+avrdude GUI (tkinter version)
+==============================
 
-A simple, dependency-free (stdlib only) cross-platform GUI front-end for the
-`avrdude` command line tool, including support for avrdude's interactive
-"terminal mode" (-t).
+A single-file, stdlib-only cross-platform GUI for avrdude.
 
-Layout strategy for picking the avrdude binary / config file:
+Operation modes on the main tab:
+  • Flash / EEPROM read, write, verify  (-U memtype:op:file:fmt)
+  • Connect / detect chip               (no -U, just connects and exits)
+  • Terminal mode                        (-t, commands typed inline)
 
-  Windows:
-    1. Look for avrdude.exe / avrdude.conf next to this script/exe.
-    2. Fall back to PATH (shutil.which).
-    If neither is found -> error dialog.
-
-  macOS / Linux:
-    1. Look for `avrdude` on PATH (shutil.which).
-    2. avrdude.conf is expected to be found by avrdude itself (system
-       location). If the user wants to override it, they can type a path
-       in the "Config file" field.
-    If avrdude is not found on PATH -> error dialog.
-
-Programmer / MCU lists:
-    Populated by running `avrdude -c ?` and `avrdude -p ?` against the
-    located avrdude binary (same approach the official avrdude Python GUI
-    uses: ask avrdude itself what it supports). Results are shown in a
-    filterable list (type to filter), similar in spirit to the
-    grouped/searchable pickers in the official GUI.
+Programmer / MCU pickers have dual ID + Description filter fields.
 """
 
 import os
@@ -46,32 +30,26 @@ from tkinter import ttk, filedialog, messagebox
 # --------------------------------------------------------------------------
 
 def app_dir():
-    """Directory containing this script (or the frozen exe)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def find_avrdude():
-    """
-    Returns (avrdude_path, conf_path_or_None, error_message_or_None)
-    """
+    """Returns (avrdude_path, conf_path_or_None, error_message_or_None)."""
     here = app_dir()
     is_windows = platform.system() == "Windows"
     exe_name = "avrdude.exe" if is_windows else "avrdude"
 
     if is_windows:
-        # 1. next to the exe/script
         local_exe = os.path.join(here, exe_name)
         local_conf = os.path.join(here, "avrdude.conf")
         if os.path.isfile(local_exe):
             conf = local_conf if os.path.isfile(local_conf) else None
             return local_exe, conf, None
 
-        # 2. PATH
         path_exe = shutil.which("avrdude")
         if path_exe:
-            # avrdude.conf may sit next to the exe found on PATH
             conf_guess = os.path.join(os.path.dirname(path_exe), "avrdude.conf")
             conf = conf_guess if os.path.isfile(conf_guess) else None
             return path_exe, conf, None
@@ -82,7 +60,6 @@ def find_avrdude():
             "as this program, or make sure avrdude is on your PATH."
         )
     else:
-        # macOS / Linux - expect avrdude on PATH, conf found by avrdude itself
         path_exe = shutil.which("avrdude")
         if path_exe:
             return path_exe, None, None
@@ -94,45 +71,24 @@ def find_avrdude():
         )
 
 
-# --------------------------------------------------------------------------
-# Helpers to query avrdude for supported programmers / parts
-# --------------------------------------------------------------------------
-
 def query_avrdude_list(avrdude_path, conf_path, flag):
-    """
-    Run `avrdude [-C conf] -c ?` or `-p ?` and parse the resulting list.
-    avrdude prints this list to stderr and exits with non-zero status,
-    which is normal.
-
-    Returns a list of (id, description) tuples.
-    """
+    """Run `avrdude [-C conf] -c ?` / `-p ?` and return list of (id, desc)."""
     cmd = [avrdude_path]
     if conf_path:
         cmd += ["-C", conf_path]
     cmd += [flag, "?"]
-
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     except Exception as e:
         return [], str(e)
-
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
     items = []
     for line in output.splitlines():
-        line = line.rstrip()
         s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        # Typical lines look like:  "  attiny13  = ATtiny13"
-        # or                        "  arduino   = Arduino"
-        if "=" not in line:
+        if not s or s.startswith("#") or "=" not in line:
             continue
         ident, _, desc = line.partition("=")
-        ident = ident.strip()
-        desc = desc.strip()
-        # Skip header-ish lines that slipped through
+        ident, desc = ident.strip(), desc.strip()
         if not ident or " " in ident:
             continue
         items.append((ident, desc))
@@ -140,16 +96,52 @@ def query_avrdude_list(avrdude_path, conf_path, flag):
 
 
 # --------------------------------------------------------------------------
-# Filterable picker dialog
+# Operation catalogue
+# --------------------------------------------------------------------------
+
+# Special sentinel labels (no -U flag)
+OP_CONNECT  = "Connect / detect chip"
+OP_TERMINAL = "Terminal mode (-t)"
+
+# Normal memory operations: (label, memtype, op_char)
+MEM_OPERATIONS = [
+    ("Read flash to file",      "flash",  "r"),
+    ("Write flash from file",   "flash",  "w"),
+    ("Verify flash",            "flash",  "v"),
+    ("Read EEPROM to file",     "eeprom", "r"),
+    ("Write EEPROM from file",  "eeprom", "w"),
+    ("Verify EEPROM",           "eeprom", "v"),
+]
+
+ALL_OP_LABELS = (
+    [OP_CONNECT, OP_TERMINAL]
+    + [o[0] for o in MEM_OPERATIONS]
+)
+
+FORMATS = [
+    "i (Intel Hex)",
+    "r (raw binary)",
+    "s (Motorola S-record)",
+    "e (ELF, write only)",
+]
+
+TERMINAL_HINT = (
+    "Enter avrdude terminal commands below, one per line.\n"
+    "'quit' is appended automatically.\n"
+    "Examples:  sig   dump flash 0 64   write eeprom 0 0xff   part"
+)
+
+
+# --------------------------------------------------------------------------
+# Filterable picker dialog  (dual ID + Description filters)
 # --------------------------------------------------------------------------
 
 class PickerDialog(tk.Toplevel):
     """
-    Modal picker with *two* independent filter fields:
-      • Filter ID          – matches against the short identifier
-      • Filter description – matches against the long description
-    Both filters are applied simultaneously (AND logic).
-    Double-clicking a row, or pressing Enter / clicking OK, selects it.
+    Modal picker with two independent filter fields:
+      • Filter ID          – matches the short identifier
+      • Filter description – matches the long description
+    Both filters applied simultaneously (AND logic).
     """
 
     def __init__(self, parent, title, items):
@@ -166,37 +158,36 @@ class PickerDialog(tk.Toplevel):
         top = ttk.Frame(self, padding=8)
         top.pack(fill="both", expand=True)
 
-        # ---- dual filter row ----
-        filter_frame = ttk.Frame(top)
-        filter_frame.pack(fill="x", pady=(0, 4))
+        # dual filter row
+        ff = ttk.Frame(top)
+        ff.pack(fill="x", pady=(0, 4))
 
-        ttk.Label(filter_frame, text="Filter ID:").pack(side="left")
+        ttk.Label(ff, text="Filter ID:").pack(side="left")
         self.filter_id_var = tk.StringVar()
-        id_entry = ttk.Entry(filter_frame, textvariable=self.filter_id_var, width=18)
+        id_entry = ttk.Entry(ff, textvariable=self.filter_id_var, width=18)
         id_entry.pack(side="left", padx=(2, 10))
         id_entry.bind("<KeyRelease>", lambda e: self._refresh())
 
-        ttk.Label(filter_frame, text="Filter description:").pack(side="left")
+        ttk.Label(ff, text="Filter description:").pack(side="left")
         self.filter_desc_var = tk.StringVar()
-        desc_entry = ttk.Entry(filter_frame, textvariable=self.filter_desc_var, width=28)
+        desc_entry = ttk.Entry(ff, textvariable=self.filter_desc_var, width=28)
         desc_entry.pack(side="left", padx=(2, 10))
         desc_entry.bind("<KeyRelease>", lambda e: self._refresh())
 
-        btn_clear = ttk.Button(filter_frame, text="Clear", width=6,
-                               command=self._clear_filters)
-        btn_clear.pack(side="left")
+        ttk.Button(ff, text="Clear", width=6,
+                   command=self._clear_filters).pack(side="left")
 
-        # ---- result count ----
+        # count label
         self.count_var = tk.StringVar()
-        ttk.Label(top, textvariable=self.count_var, foreground="gray").pack(anchor="w")
+        ttk.Label(top, textvariable=self.count_var,
+                  foreground="gray").pack(anchor="w")
 
-        # ---- tree ----
-        tree_frame = ttk.Frame(top)
-        tree_frame.pack(fill="both", expand=True, pady=(2, 0))
+        # tree + scrollbar
+        tf = ttk.Frame(top)
+        tf.pack(fill="both", expand=True, pady=(2, 0))
 
-        cols = ("id", "description")
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
-                                  selectmode="browse")
+        self.tree = ttk.Treeview(tf, columns=("id", "description"),
+                                  show="headings", selectmode="browse")
         self.tree.heading("id", text="ID",
                           command=lambda: self._sort_col("id", False))
         self.tree.heading("description", text="Description",
@@ -204,7 +195,7 @@ class PickerDialog(tk.Toplevel):
         self.tree.column("id", width=160, anchor="w")
         self.tree.column("description", width=380, anchor="w")
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -212,7 +203,7 @@ class PickerDialog(tk.Toplevel):
         self.tree.bind("<Double-1>", lambda e: self.on_ok())
         self.tree.bind("<Return>",   lambda e: self.on_ok())
 
-        # ---- buttons ----
+        # buttons
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=(8, 0))
         ttk.Button(btns, text="OK",     command=self.on_ok).pack(side="right")
@@ -220,8 +211,6 @@ class PickerDialog(tk.Toplevel):
 
         self._refresh()
         id_entry.focus_set()
-
-    # ---------------------------------------------------------------- helpers
 
     def _clear_filters(self):
         self.filter_id_var.set("")
@@ -231,7 +220,6 @@ class PickerDialog(tk.Toplevel):
     def _refresh(self):
         fi = self.filter_id_var.get().strip().lower()
         fd = self.filter_desc_var.get().strip().lower()
-
         self.tree.delete(*self.tree.get_children())
         count = 0
         for ident, desc in self.items:
@@ -241,19 +229,16 @@ class PickerDialog(tk.Toplevel):
                 continue
             self.tree.insert("", "end", values=(ident, desc))
             count += 1
-
         total = len(self.items)
-        if fi or fd:
-            self.count_var.set(f"{count} of {total} entries shown")
-        else:
-            self.count_var.set(f"{total} entries")
+        self.count_var.set(
+            f"{count} of {total} entries shown" if (fi or fd) else f"{total} entries"
+        )
 
     def _sort_col(self, col, reverse):
-        """Sort tree by column header click."""
         data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
         data.sort(reverse=reverse)
-        for index, (_, k) in enumerate(data):
-            self.tree.move(k, "", index)
+        for i, (_, k) in enumerate(data):
+            self.tree.move(k, "", i)
         self.tree.heading(col, command=lambda: self._sort_col(col, not reverse))
 
     def on_ok(self):
@@ -269,57 +254,40 @@ class PickerDialog(tk.Toplevel):
 
 class AvrdudeGUI(tk.Tk):
 
-    OPERATIONS = [
-        ("Read flash to file",   "flash", "r"),
-        ("Write flash from file","flash", "w"),
-        ("Verify flash",         "flash", "v"),
-        ("Read EEPROM to file",  "eeprom", "r"),
-        ("Write EEPROM from file","eeprom", "w"),
-        ("Verify EEPROM",        "eeprom", "v"),
-    ]
-
-    FORMATS = ["i (Intel Hex)", "r (raw binary)", "s (Motorola S-record)",
-               "e (ELF, write only)"]
-
     def __init__(self):
         super().__init__()
         self.title("avrdude GUI")
-        self.geometry("780x640")
+        self.geometry("820x700")
+        self.minsize(700, 580)
 
         self.avrdude_path = None
-        self.conf_path = None
-        self.programmers = []
-        self.parts = []
+        self.conf_path    = None
+        self.programmers  = []
+        self.parts        = []
 
-        self.proc = None          # currently running subprocess
+        self.proc      = None
         self.out_queue = queue.Queue()
 
         self._build_ui()
         self._locate_avrdude()
-
         self.after(100, self._poll_output)
 
-    # ---------------------------------------------------------------- UI --
+    # ------------------------------------------------------------------ UI
 
     def _build_ui(self):
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        # ---- single main frame (no notebook needed any more) ----
+        main_outer = ttk.Frame(self)
+        main_outer.pack(fill="both", expand=False, padx=8, pady=(8, 4))
+        self._build_main_tab(main_outer)
 
-        self.tab_main = ttk.Frame(nb)
-        self.tab_terminal = ttk.Frame(nb)
-        nb.add(self.tab_main, text="Program")
-        nb.add(self.tab_terminal, text="Terminal mode")
-
-        self._build_main_tab(self.tab_main)
-        self._build_terminal_tab(self.tab_terminal)
-
-        # Shared output box + buttons live below the notebook
+        # ---- output ----
         out_frame = ttk.LabelFrame(self, text="Output")
         out_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        self.output = tk.Text(out_frame, height=14, wrap="word",
-                               font=("Consolas" if platform.system() == "Windows"
-                                     else "Menlo", 10))
+        self.output = tk.Text(
+            out_frame, height=14, wrap="word",
+            font=("Consolas" if platform.system() == "Windows" else "Menlo", 10)
+        )
         self.output.pack(fill="both", expand=True, side="top")
         sb = ttk.Scrollbar(self.output, command=self.output.yview)
         self.output.configure(yscrollcommand=sb.set)
@@ -327,125 +295,180 @@ class AvrdudeGUI(tk.Tk):
 
         btn_row = ttk.Frame(out_frame)
         btn_row.pack(fill="x", pady=4)
-        ttk.Button(btn_row, text="Copy", command=self.copy_output).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Copy",  command=self.copy_output).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Clear", command=self.clear_output).pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="")
         ttk.Label(btn_row, textvariable=self.status_var).pack(side="left", padx=12)
-
-        self.btn_cancel = ttk.Button(btn_row, text="Cancel", command=self.cancel_run, state="disabled")
+        self.btn_cancel = ttk.Button(btn_row, text="Cancel",
+                                      command=self.cancel_run, state="disabled")
         self.btn_cancel.pack(side="right", padx=4)
 
     def _build_main_tab(self, parent):
-        frm = ttk.Frame(parent, padding=8)
+        frm = ttk.Frame(parent, padding=4)
         frm.pack(fill="both", expand=True)
 
-        # Programmer / Part / Port row
-        row = 0
-        ttk.Label(frm, text="Programmer (-c):").grid(row=row, column=0, sticky="w")
+        # ---- row 0: programmer / part ----
+        r = 0
+        ttk.Label(frm, text="Programmer (-c):").grid(row=r, column=0, sticky="e", padx=(0, 4))
         self.programmer_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.programmer_var, width=20).grid(row=row, column=1, sticky="w")
-        ttk.Button(frm, text="Select...", command=self.pick_programmer).grid(row=row, column=2, padx=4)
+        ttk.Entry(frm, textvariable=self.programmer_var, width=20).grid(row=r, column=1, sticky="w")
+        ttk.Button(frm, text="Select…", command=self.pick_programmer).grid(row=r, column=2, padx=4)
 
-        ttk.Label(frm, text="MCU (-p):").grid(row=row, column=3, sticky="w", padx=(16, 0))
+        ttk.Label(frm, text="MCU (-p):").grid(row=r, column=3, sticky="e", padx=(12, 4))
         self.part_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.part_var, width=14).grid(row=row, column=4, sticky="w")
-        ttk.Button(frm, text="Select...", command=self.pick_part).grid(row=row, column=5, padx=4)
+        ttk.Entry(frm, textvariable=self.part_var, width=14).grid(row=r, column=4, sticky="w")
+        ttk.Button(frm, text="Select…", command=self.pick_part).grid(row=r, column=5, padx=4)
 
-        row += 1
-        ttk.Label(frm, text="Port (-P):").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        # ---- row 1: port / baud ----
+        r += 1
+        ttk.Label(frm, text="Port (-P):").grid(row=r, column=0, sticky="e", padx=(0, 4), pady=(6, 0))
         self.port_var = tk.StringVar(value="usb")
-        port_entry = ttk.Combobox(frm, textvariable=self.port_var, width=18,
-                                   values=self._guess_ports())
-        port_entry.grid(row=row, column=1, sticky="w", pady=(6, 0))
+        ttk.Combobox(frm, textvariable=self.port_var, width=18,
+                     values=self._guess_ports()).grid(row=r, column=1, sticky="w", pady=(6, 0))
 
-        ttk.Label(frm, text="Baud (-b):").grid(row=row, column=3, sticky="w", padx=(16, 0), pady=(6, 0))
+        ttk.Label(frm, text="Baud (-b):").grid(row=r, column=3, sticky="e", padx=(12, 4), pady=(6, 0))
         self.baud_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.baud_var, width=10).grid(row=row, column=4, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=self.baud_var, width=10).grid(row=r, column=4, sticky="w", pady=(6, 0))
 
-        row += 1
-        ttk.Label(frm, text="Config file (-C, optional):").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        # ---- row 2: config file ----
+        r += 1
+        ttk.Label(frm, text="Config file (-C):").grid(row=r, column=0, sticky="e", padx=(0, 4), pady=(6, 0))
         self.conf_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.conf_var, width=40).grid(row=row, column=1, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(frm, text="Browse...", command=self.browse_conf).grid(row=row, column=4, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=self.conf_var, width=40).grid(
+            row=r, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(frm, text="Browse…", command=self.browse_conf).grid(row=r, column=4, pady=(6, 0))
 
-        row += 1
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=6, sticky="ew", pady=10)
+        # ---- separator ----
+        r += 1
+        ttk.Separator(frm).grid(row=r, column=0, columnspan=6, sticky="ew", pady=8)
 
-        # Operation block
-        row += 1
-        ttk.Label(frm, text="Operation:").grid(row=row, column=0, sticky="w")
-        self.op_var = tk.StringVar(value=self.OPERATIONS[0][0])
-        op_combo = ttk.Combobox(frm, textvariable=self.op_var, width=22,
-                                 values=[o[0] for o in self.OPERATIONS], state="readonly")
-        op_combo.grid(row=row, column=1, columnspan=2, sticky="w")
+        # ---- row: operation + format ----
+        r += 1
+        ttk.Label(frm, text="Operation:").grid(row=r, column=0, sticky="e", padx=(0, 4))
+        self.op_var = tk.StringVar(value=OP_CONNECT)
+        self.op_combo = ttk.Combobox(frm, textvariable=self.op_var,
+                                      values=ALL_OP_LABELS,
+                                      state="readonly", width=26)
+        self.op_combo.grid(row=r, column=1, columnspan=2, sticky="w")
+        self.op_var.trace_add("write", lambda *_: self._on_op_change())
 
-        ttk.Label(frm, text="Format (-i/o):").grid(row=row, column=3, sticky="w", padx=(16, 0))
-        self.format_var = tk.StringVar(value=self.FORMATS[0])
-        ttk.Combobox(frm, textvariable=self.format_var, width=18,
-                     values=self.FORMATS, state="readonly").grid(row=row, column=4, sticky="w")
+        ttk.Label(frm, text="Format:").grid(row=r, column=3, sticky="e", padx=(12, 4))
+        self.format_var = tk.StringVar(value=FORMATS[0])
+        self.format_combo = ttk.Combobox(frm, textvariable=self.format_var,
+                                          values=FORMATS, state="readonly", width=20)
+        self.format_combo.grid(row=r, column=4, sticky="w")
 
-        row += 1
-        ttk.Label(frm, text="File:").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        # ---- row: file (hidden for Connect / Terminal) ----
+        r += 1
+        self.file_label = ttk.Label(frm, text="File:")
+        self.file_label.grid(row=r, column=0, sticky="e", padx=(0, 4), pady=(6, 0))
         self.file_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.file_var, width=40).grid(row=row, column=1, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Button(frm, text="Browse...", command=self.browse_file).grid(row=row, column=4, sticky="w", pady=(6, 0))
+        self.file_entry = ttk.Entry(frm, textvariable=self.file_var, width=40)
+        self.file_entry.grid(row=r, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self.file_btn = ttk.Button(frm, text="Browse…", command=self.browse_file)
+        self.file_btn.grid(row=r, column=4, pady=(6, 0))
 
-        row += 1
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=6, sticky="ew", pady=10)
+        # ---- row: terminal commands (shown only for Terminal mode) ----
+        r += 1
+        self.term_label = ttk.Label(frm, text="Commands:")
+        self.term_label.grid(row=r, column=0, sticky="ne", padx=(0, 4), pady=(6, 0))
+        self.term_cmds = tk.Text(frm, height=5, width=52)
+        self.term_cmds.insert("1.0", "sig\n")
+        self.term_cmds.grid(row=r, column=1, columnspan=4, sticky="ew", pady=(6, 0))
 
-        # Extra options
-        row += 1
+        self.term_hint_label = ttk.Label(frm, text=TERMINAL_HINT,
+                                          justify="left", foreground="gray",
+                                          wraplength=480)
+        r += 1
+        self.term_hint_label.grid(row=r, column=1, columnspan=4, sticky="w")
+
+        # ---- separator ----
+        r += 1
+        ttk.Separator(frm).grid(row=r, column=0, columnspan=6, sticky="ew", pady=8)
+
+        # ---- checkboxes + extra args ----
+        r += 1
         self.disable_verify_var = tk.BooleanVar()
-        ttk.Checkbutton(frm, text="Disable auto-verify (-V)", variable=self.disable_verify_var).grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(frm, text="Disable auto-verify (-V)",
+                         variable=self.disable_verify_var).grid(row=r, column=0, columnspan=3, sticky="w")
         self.disable_erase_var = tk.BooleanVar()
-        ttk.Checkbutton(frm, text="Disable chip erase (-D)", variable=self.disable_erase_var).grid(row=row, column=2, columnspan=2, sticky="w")
+        ttk.Checkbutton(frm, text="Disable chip erase (-D)",
+                         variable=self.disable_erase_var).grid(row=r, column=3, columnspan=3, sticky="w")
 
-        row += 1
-        ttk.Label(frm, text="Extra args:").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        r += 1
+        ttk.Label(frm, text="Extra args:").grid(row=r, column=0, sticky="e", padx=(0, 4), pady=(6, 0))
         self.extra_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.extra_var, width=60).grid(row=row, column=1, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=self.extra_var, width=60).grid(
+            row=r, column=1, columnspan=5, sticky="ew", pady=(6, 0))
 
-        row += 1
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=6, sticky="ew", pady=10)
-
-        # Command preview + run
-        row += 1
-        ttk.Label(frm, text="Command:").grid(row=row, column=0, sticky="w")
+        # ---- command preview + run ----
+        r += 1
+        ttk.Separator(frm).grid(row=r, column=0, columnspan=6, sticky="ew", pady=8)
+        r += 1
+        ttk.Label(frm, text="Command:").grid(row=r, column=0, sticky="e", padx=(0, 4))
         self.cmd_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.cmd_var, state="readonly").grid(row=row, column=1, columnspan=5, sticky="ew")
+        ttk.Entry(frm, textvariable=self.cmd_var, state="readonly").grid(
+            row=r, column=1, columnspan=5, sticky="ew")
 
-        row += 1
+        r += 1
         btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=6, sticky="w", pady=8)
-        ttk.Button(btns, text="Update command preview", command=self.update_command_preview).pack(side="left", padx=4)
-        ttk.Button(btns, text="Run", command=lambda: self.run_avrdude()).pack(side="left", padx=4)
+        btns.grid(row=r, column=0, columnspan=6, sticky="w", pady=8)
+        ttk.Button(btns, text="Update preview",
+                   command=self.update_command_preview).pack(side="left", padx=4)
+        ttk.Button(btns, text="▶  Run",
+                   command=self.run_avrdude).pack(side="left", padx=4)
 
         for c in range(6):
-            frm.columnconfigure(c, weight=1)
+            frm.columnconfigure(c, weight=1 if c in (1, 4) else 0)
 
-        # update preview on any change
+        # auto-update preview
         for v in (self.programmer_var, self.part_var, self.port_var, self.baud_var,
                   self.conf_var, self.op_var, self.format_var, self.file_var,
                   self.disable_verify_var, self.disable_erase_var, self.extra_var):
-            v.trace_add("write", lambda *a: self.update_command_preview())
+            v.trace_add("write", lambda *_: self.update_command_preview())
 
-    def _build_terminal_tab(self, parent):
-        frm = ttk.Frame(parent, padding=8)
-        frm.pack(fill="both", expand=True)
+        # initialise visibility
+        self._on_op_change()
 
-        info = ("Terminal mode runs `avrdude -t ... ` and sends the commands "
-                "below to its interactive prompt (one per line). "
-                "Common commands: d/dump, w/write, p/part, sig, q/quit.")
-        ttk.Label(frm, text=info, wraplength=720, justify="left").pack(anchor="w", pady=(0, 6))
+    # -------------------------------------------------------------- op change
 
-        ttk.Label(frm, text="Commands (one per line, 'quit' is appended automatically):").pack(anchor="w")
-        self.term_cmds = tk.Text(frm, height=8)
-        self.term_cmds.pack(fill="both", expand=False, pady=(0, 8))
-        self.term_cmds.insert("1.0", "sig\n")
+    def _is_terminal_mode(self):
+        return self.op_var.get() == OP_TERMINAL
 
-        ttk.Button(frm, text="Run terminal session", command=self.run_terminal).pack(anchor="w")
+    def _is_connect_mode(self):
+        return self.op_var.get() == OP_CONNECT
 
-    # --------------------------------------------------------------- init --
+    def _needs_file(self):
+        """True for memory operations that require a file (r/w, not verify)."""
+        op = self.op_var.get()
+        for label, _, op_char in MEM_OPERATIONS:
+            if label == op and op_char in ("r", "w"):
+                return True
+        return False
+
+    def _on_op_change(self):
+        """Show/hide file row and terminal-commands row based on selection."""
+        is_term = self._is_terminal_mode()
+        is_conn = self._is_connect_mode()
+        is_mem  = not is_term and not is_conn
+
+        # terminal command box
+        state_term = "normal" if is_term else "disabled"
+        self.term_cmds.configure(state=state_term)
+        fg_hint = "gray" if is_term else "#b0b0b0"
+        self.term_hint_label.configure(foreground=fg_hint)
+
+        # file widgets
+        state_file = "normal" if is_mem else "disabled"
+        self.file_entry.configure(state=state_file)
+        self.file_btn.configure(state=state_file)
+
+        # format combo (only meaningful for memory ops)
+        self.format_combo.configure(state="readonly" if is_mem else "disabled")
+
+        self.update_command_preview()
+
+    # ----------------------------------------------------------------- init
 
     def _guess_ports(self):
         sysname = platform.system()
@@ -474,29 +497,28 @@ class AvrdudeGUI(tk.Tk):
             self.status_var.set("avrdude not found")
             return
         self.avrdude_path = path
-        self.conf_path = conf
+        self.conf_path    = conf
         if conf:
             self.conf_var.set(conf)
         self.status_var.set(f"avrdude: {path}")
-
-        # populate programmer / part lists in background
         threading.Thread(target=self._load_lists, daemon=True).start()
 
     def _load_lists(self):
-        progs, perr = query_avrdude_list(self.avrdude_path, self.conf_path_value(), "-c")
-        parts, parr = query_avrdude_list(self.avrdude_path, self.conf_path_value(), "-p")
+        progs, _ = query_avrdude_list(self.avrdude_path, self._conf_value(), "-c")
+        parts, _ = query_avrdude_list(self.avrdude_path, self._conf_value(), "-p")
         self.programmers = sorted(progs)
-        self.parts = sorted(parts)
+        self.parts       = sorted(parts)
 
-    def conf_path_value(self):
+    def _conf_value(self):
         v = self.conf_var.get().strip()
         return v if v else self.conf_path
 
-    # ------------------------------------------------------------- pickers --
+    # -------------------------------------------------------------- pickers
 
     def pick_programmer(self):
         if not self.programmers:
-            messagebox.showinfo("Please wait", "Programmer list is still loading, or avrdude could not be queried.")
+            messagebox.showinfo("Please wait",
+                "Programmer list is still loading, or avrdude could not be queried.")
             return
         dlg = PickerDialog(self, "Select programmer", self.programmers)
         self.wait_window(dlg)
@@ -505,26 +527,33 @@ class AvrdudeGUI(tk.Tk):
 
     def pick_part(self):
         if not self.parts:
-            messagebox.showinfo("Please wait", "Part list is still loading, or avrdude could not be queried.")
+            messagebox.showinfo("Please wait",
+                "Part list is still loading, or avrdude could not be queried.")
             return
-        dlg = PickerDialog(self, "Select MCU", self.parts)
+        dlg = PickerDialog(self, "Select MCU / part", self.parts)
         self.wait_window(dlg)
         if dlg.result:
             self.part_var.set(dlg.result)
 
     def browse_file(self):
-        f = filedialog.askopenfilename() if "Write" in self.op_var.get() else filedialog.asksaveasfilename()
+        if "Write" in self.op_var.get():
+            f = filedialog.askopenfilename()
+        else:
+            f = filedialog.asksaveasfilename()
         if f:
             self.file_var.set(f)
 
     def browse_conf(self):
-        f = filedialog.askopenfilename(filetypes=[("avrdude conf", "avrdude.conf"), ("All files", "*.*")])
+        f = filedialog.askopenfilename(
+            filetypes=[("avrdude conf", "avrdude.conf"), ("All files", "*.*")]
+        )
         if f:
             self.conf_var.set(f)
 
-    # ---------------------------------------------------------- command ----
+    # -------------------------------------------------------------- command
 
-    def build_args(self):
+    def _base_args(self):
+        """Build the common part of the avrdude command (no -U / -t)."""
         if not self.avrdude_path:
             raise RuntimeError("avrdude was not found. See the error shown at startup.")
 
@@ -555,27 +584,39 @@ class AvrdudeGUI(tk.Tk):
         if self.disable_erase_var.get():
             args.append("-D")
 
-        # Operation -> -U memtype:op:filename:format
-        op_label = self.op_var.get()
-        memtype, op = None, None
-        for label, mem, o in self.OPERATIONS:
-            if label == op_label:
-                memtype, op = mem, o
-                break
-
-        fmt_full = self.format_var.get()
-        fmt = fmt_full.split()[0] if fmt_full else "i"
-
-        fname = self.file_var.get().strip()
-        if memtype and op:
-            if op in ("r", "w") and not fname:
-                raise RuntimeError("Please choose a file for this operation.")
-            target = fname if fname else "-"
-            args += ["-U", f"{memtype}:{op}:{target}:{fmt}"]
-
         extra = self.extra_var.get().strip()
         if extra:
             args += extra.split()
+
+        return args
+
+    def build_args(self):
+        """Full argument list for the currently selected operation."""
+        args = self._base_args()
+        op   = self.op_var.get()
+
+        if op == OP_CONNECT:
+            # no -U, avrdude just connects, reports chip id, then exits
+            pass
+
+        elif op == OP_TERMINAL:
+            args.append("-t")
+
+        else:
+            # memory operation -> -U memtype:op:file:fmt
+            memtype = op_char = None
+            for label, mem, o in MEM_OPERATIONS:
+                if label == op:
+                    memtype, op_char = mem, o
+                    break
+            if memtype:
+                fmt   = (self.format_var.get().split()[0]
+                         if self.format_var.get() else "i")
+                fname = self.file_var.get().strip()
+                if op_char in ("r", "w") and not fname:
+                    raise RuntimeError("Please choose a file for this operation.")
+                target = fname if fname else "-"
+                args += ["-U", f"{memtype}:{op_char}:{target}:{fmt}"]
 
         return args
 
@@ -588,13 +629,11 @@ class AvrdudeGUI(tk.Tk):
 
     @staticmethod
     def _quote(s):
-        if " " in s or "" == s:
-            return f'"{s}"'
-        return s
+        return f'"{s}"' if (" " in s or s == "") else s
 
-    # ------------------------------------------------------------- running --
+    # -------------------------------------------------------------- running
 
-    def run_avrdude(self, stdin_text=None):
+    def run_avrdude(self):
         if self.proc is not None:
             messagebox.showwarning("Busy", "A command is already running.")
             return
@@ -605,26 +644,38 @@ class AvrdudeGUI(tk.Tk):
             return
 
         self.update_command_preview()
+
+        # For terminal mode, gather the commands to pipe to stdin
+        stdin_text = None
+        if self._is_terminal_mode():
+            cmds = [c for c in self.term_cmds.get("1.0", "end").splitlines()
+                    if c.strip()]
+            if not any(c.strip().lower() in ("q", "quit") for c in cmds):
+                cmds.append("quit")
+            stdin_text = "\n".join(cmds) + "\n"
+            for c in cmds:
+                self._append(f">>> {c}\n")
+
         self._append(f"$ {' '.join(args)}\n")
-        self.status_var.set("Running...")
+        self.status_var.set("Running…")
         self.btn_cancel.configure(state="normal")
 
         def worker():
             try:
                 self.proc = subprocess.Popen(
                     args,
-                    stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
                 )
-            except Exception as e:
-                self.out_queue.put(("line", f"Failed to start avrdude: {e}\n"))
+            except Exception as exc:
+                self.out_queue.put(("line", f"Failed to start avrdude: {exc}\n"))
                 self.out_queue.put(("done", None))
                 return
 
-            if stdin_text is not None:
+            if stdin_text:
                 try:
                     self.proc.stdin.write(stdin_text)
                     self.proc.stdin.close()
@@ -635,63 +686,9 @@ class AvrdudeGUI(tk.Tk):
                 self.out_queue.put(("line", line))
 
             self.proc.wait()
-            self.out_queue.put(("line", f"\n[process exited with code {self.proc.returncode}]\n"))
-            self.out_queue.put(("done", None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def run_terminal(self):
-        cmds = self.term_cmds.get("1.0", "end").strip().splitlines()
-        cmds = [c for c in cmds if c.strip()]
-        if not any(c.strip().lower() in ("q", "quit") for c in cmds):
-            cmds.append("quit")
-        stdin_text = "\n".join(cmds) + "\n"
-
-        # Add -t to a copy of the args
-        try:
-            args = self.build_args()
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-            return
-        if "-t" not in args:
-            args.append("-t")
-
-        if self.proc is not None:
-            messagebox.showwarning("Busy", "A command is already running.")
-            return
-
-        self._append(f"$ {' '.join(args)}\n")
-        for c in cmds:
-            self._append(f">>> {c}\n")
-        self.status_var.set("Running terminal session...")
-        self.btn_cancel.configure(state="normal")
-
-        def worker():
-            try:
-                self.proc = subprocess.Popen(
-                    args,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-            except Exception as e:
-                self.out_queue.put(("line", f"Failed to start avrdude: {e}\n"))
-                self.out_queue.put(("done", None))
-                return
-
-            try:
-                self.proc.stdin.write(stdin_text)
-                self.proc.stdin.close()
-            except Exception:
-                pass
-
-            for line in self.proc.stdout:
-                self.out_queue.put(("line", line))
-
-            self.proc.wait()
-            self.out_queue.put(("line", f"\n[process exited with code {self.proc.returncode}]\n"))
+            self.out_queue.put(
+                ("line", f"\n[process exited with code {self.proc.returncode}]\n")
+            )
             self.out_queue.put(("done", None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -717,7 +714,7 @@ class AvrdudeGUI(tk.Tk):
             pass
         self.after(100, self._poll_output)
 
-    # ------------------------------------------------------------- output --
+    # -------------------------------------------------------------- output
 
     def _append(self, text):
         self.output.insert("end", text)

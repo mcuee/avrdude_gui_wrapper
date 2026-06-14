@@ -3,29 +3,17 @@
 avrdude GUI (PySide6 version)
 ==============================
 
-A single-file PySide6 front-end for `avrdude`, including support for
-avrdude's interactive "terminal mode" (-t).
+A single-file PySide6 front-end for `avrdude`.
+
+Operation modes on the main tab:
+  • Connect / detect chip  (no -U, just connects and exits)
+  • Terminal mode           (-t, commands typed inline on the same tab)
+  • Flash / EEPROM read, write, verify  (-U memtype:op:file:fmt)
+
+Programmer / MCU pickers have dual ID + Description filter fields.
+Theme switcher (Light / Dark / System) in the status bar; preference saved.
 
 Requires: PySide6   (pip install PySide6)
-
-Binary / config location strategy:
-
-  Windows:
-    1. avrdude.exe / avrdude.conf next to this script/exe.
-    2. Fall back to PATH.
-    -> error dialog if neither found.
-
-  macOS / Linux:
-    1. `avrdude` on PATH (avrdude.conf found by avrdude itself, or
-       overridden via the "Config file" field).
-    -> error dialog if not found.
-
-Programmer / MCU lists are obtained by running `avrdude -c ?` and
-`avrdude -p ?` against the located binary (same approach as the official
-avrdude Python GUI), then shown in a filterable picker dialog with
-separate ID and Description filter fields.
-
-Theme support: Light, Dark, System (auto-follow OS preference).
 """
 
 import os
@@ -39,9 +27,9 @@ from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QCheckBox,
-    QPlainTextEdit, QFileDialog, QMessageBox, QTabWidget, QGroupBox,
+    QPlainTextEdit, QFileDialog, QMessageBox, QGroupBox,
     QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QStatusBar,
-    QSizePolicy,
+    QSizePolicy, QFrame,
 )
 
 
@@ -56,7 +44,6 @@ def app_dir():
 
 
 def find_avrdude():
-    """Returns (avrdude_path, conf_path_or_None, error_message_or_None)."""
     here = app_dir()
     is_windows = platform.system() == "Windows"
     exe_name = "avrdude.exe" if is_windows else "avrdude"
@@ -67,17 +54,15 @@ def find_avrdude():
         if os.path.isfile(local_exe):
             conf = local_conf if os.path.isfile(local_conf) else None
             return local_exe, conf, None
-
         path_exe = shutil.which("avrdude")
         if path_exe:
             conf_guess = os.path.join(os.path.dirname(path_exe), "avrdude.conf")
             conf = conf_guess if os.path.isfile(conf_guess) else None
             return path_exe, conf, None
-
         return None, None, (
-            "Could not find avrdude.exe.\n\n"
-            "Please place avrdude.exe (and avrdude.conf) in the same folder "
-            "as this program, or make sure avrdude is on your PATH."
+            "Could not find avrdude.exe.\n\nPlease place avrdude.exe "
+            "(and avrdude.conf) in the same folder as this program, "
+            "or make sure avrdude is on your PATH."
         )
     else:
         path_exe = shutil.which("avrdude")
@@ -86,27 +71,22 @@ def find_avrdude():
         return None, None, (
             "Could not find the 'avrdude' executable on your PATH.\n\n"
             "Please install avrdude (e.g. via Homebrew on macOS or your "
-            "distro's package manager on Linux) and make sure it is on "
-            "your PATH."
+            "distro's package manager on Linux) and make sure it is on your PATH."
         )
 
 
 def query_avrdude_list(avrdude_path, conf_path, flag):
-    """Run `avrdude [-C conf] -c ?` / `-p ?` and parse "id = description" lines."""
     cmd = [avrdude_path]
     if conf_path:
         cmd += ["-C", conf_path]
     cmd += [flag, "?"]
-
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     except Exception as e:
         return [], str(e)
-
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
     items = []
     for line in output.splitlines():
-        line = line.rstrip()
         s = line.strip()
         if not s or s.startswith("#") or "=" not in line:
             continue
@@ -119,6 +99,38 @@ def query_avrdude_list(avrdude_path, conf_path, flag):
 
 
 # --------------------------------------------------------------------------
+# Operation catalogue
+# --------------------------------------------------------------------------
+
+OP_CONNECT  = "Connect / detect chip"
+OP_TERMINAL = "Terminal mode (-t)"
+
+MEM_OPERATIONS = [
+    ("Read flash to file",      "flash",  "r"),
+    ("Write flash from file",   "flash",  "w"),
+    ("Verify flash",            "flash",  "v"),
+    ("Read EEPROM to file",     "eeprom", "r"),
+    ("Write EEPROM from file",  "eeprom", "w"),
+    ("Verify EEPROM",           "eeprom", "v"),
+]
+
+ALL_OP_LABELS = [OP_CONNECT, OP_TERMINAL] + [o[0] for o in MEM_OPERATIONS]
+
+FORMATS = [
+    "i (Intel Hex)",
+    "r (raw binary)",
+    "s (Motorola S-record)",
+    "e (ELF, write only)",
+]
+
+TERMINAL_HINT = (
+    "Enter avrdude terminal commands, one per line. "
+    "'quit' is appended automatically.\n"
+    "Examples:  sig   dump flash 0 64   write eeprom 0 0xff   part"
+)
+
+
+# --------------------------------------------------------------------------
 # Theme management
 # --------------------------------------------------------------------------
 
@@ -127,7 +139,6 @@ THEME_LIGHT  = "Light"
 THEME_DARK   = "Dark"
 THEMES       = [THEME_SYSTEM, THEME_LIGHT, THEME_DARK]
 
-# A clean, readable dark palette
 _DARK_PALETTE = {
     QPalette.Window:          "#2b2b2b",
     QPalette.WindowText:      "#f0f0f0",
@@ -144,14 +155,11 @@ _DARK_PALETTE = {
     QPalette.HighlightedText: "#ffffff",
     QPalette.PlaceholderText: "#888888",
 }
-
 _DARK_DISABLED = {
     QPalette.Text:       "#666666",
     QPalette.ButtonText: "#666666",
     QPalette.WindowText: "#666666",
 }
-
-# A clean light palette (explicit so switching back from dark is clean)
 _LIGHT_PALETTE = {
     QPalette.Window:          "#f0f0f0",
     QPalette.WindowText:      "#1a1a1a",
@@ -168,7 +176,6 @@ _LIGHT_PALETTE = {
     QPalette.HighlightedText: "#ffffff",
     QPalette.PlaceholderText: "#999999",
 }
-
 _LIGHT_DISABLED = {
     QPalette.Text:       "#a0a0a0",
     QPalette.ButtonText: "#a0a0a0",
@@ -176,82 +183,74 @@ _LIGHT_DISABLED = {
 }
 
 
-def _build_palette(color_map, disabled_map):
+def _build_palette(colors, disabled):
     pal = QPalette()
-    for role, color in color_map.items():
+    for role, color in colors.items():
         pal.setColor(QPalette.Active,   role, QColor(color))
         pal.setColor(QPalette.Inactive, role, QColor(color))
-    for role, color in disabled_map.items():
+    for role, color in disabled.items():
         pal.setColor(QPalette.Disabled, role, QColor(color))
     return pal
 
 
 def apply_theme(app: QApplication, theme: str):
-    """Apply Light / Dark / System theme to the QApplication."""
-    app.setStyle("Fusion")          # Fusion renders palettes faithfully on all OS
+    app.setStyle("Fusion")
     if theme == THEME_DARK:
         app.setPalette(_build_palette(_DARK_PALETTE, _DARK_DISABLED))
         app.setStyleSheet(
-            "QToolTip { color: #f0f0f0; background-color: #1e1e1e; "
-            "border: 1px solid #555; }"
+            "QToolTip { color:#f0f0f0; background:#1e1e1e; border:1px solid #555; }"
         )
     elif theme == THEME_LIGHT:
         app.setPalette(_build_palette(_LIGHT_PALETTE, _LIGHT_DISABLED))
         app.setStyleSheet("")
-    else:  # System
+    else:
         app.setPalette(app.style().standardPalette())
         app.setStyleSheet("")
 
 
 # --------------------------------------------------------------------------
-# Filterable picker dialog  (separate ID + Description filter fields)
+# Filterable picker dialog  (dual ID + Description filters)
 # --------------------------------------------------------------------------
 
 class PickerDialog(QDialog):
     """
-    Shows a two-column (ID / Description) list with *two* independent filter
-    boxes so the user can narrow by ID alone, description alone, or both at
-    once.
+    Two independent filter fields (ID and Description, AND logic),
+    sortable columns, live result count.
     """
 
     def __init__(self, parent, title, items):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(600, 480)
+        self.resize(620, 480)
         self.items = items
         self.result_value = None
 
         layout = QVBoxLayout(self)
 
-        # ---- dual filter row ----
+        # dual filter row
         filter_row = QHBoxLayout()
-
         filter_row.addWidget(QLabel("Filter ID:"))
         self.filter_id = QLineEdit()
         self.filter_id.setPlaceholderText("e.g.  arduino")
         self.filter_id.textChanged.connect(self._refresh)
         filter_row.addWidget(self.filter_id, 1)
-
         filter_row.addSpacing(12)
-
         filter_row.addWidget(QLabel("Filter description:"))
         self.filter_desc = QLineEdit()
         self.filter_desc.setPlaceholderText("e.g.  Uno")
         self.filter_desc.textChanged.connect(self._refresh)
         filter_row.addWidget(self.filter_desc, 2)
-
         btn_clear = QPushButton("Clear")
         btn_clear.setFixedWidth(54)
         btn_clear.clicked.connect(self._clear_filters)
         filter_row.addWidget(btn_clear)
-
         layout.addLayout(filter_row)
 
-        # ---- result count label ----
+        # count label
         self.count_label = QLabel()
         layout.addWidget(self.count_label)
 
-        # ---- tree ----
+        # tree
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["ID", "Description"])
@@ -261,7 +260,6 @@ class PickerDialog(QDialog):
         self.tree.itemDoubleClicked.connect(self._accept_current)
         layout.addWidget(self.tree)
 
-        # ---- buttons ----
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._accept_current)
         buttons.rejected.connect(self.reject)
@@ -278,7 +276,6 @@ class PickerDialog(QDialog):
     def _refresh(self):
         fi = self.filter_id.text().strip().lower()
         fd = self.filter_desc.text().strip().lower()
-
         self.tree.clear()
         count = 0
         for ident, desc in self.items:
@@ -288,7 +285,6 @@ class PickerDialog(QDialog):
                 continue
             QTreeWidgetItem(self.tree, [ident, desc])
             count += 1
-
         total = len(self.items)
         self.count_label.setText(
             f"{count} of {total} entries" if (fi or fd) else f"{total} entries"
@@ -305,25 +301,9 @@ class PickerDialog(QDialog):
 # Main window
 # --------------------------------------------------------------------------
 
-OPERATIONS = [
-    ("Read flash to file",     "flash",  "r"),
-    ("Write flash from file",  "flash",  "w"),
-    ("Verify flash",           "flash",  "v"),
-    ("Read EEPROM to file",    "eeprom", "r"),
-    ("Write EEPROM from file", "eeprom", "w"),
-    ("Verify EEPROM",          "eeprom", "v"),
-]
-
-FORMATS = [
-    "i (Intel Hex)",
-    "r (raw binary)",
-    "s (Motorola S-record)",
-    "e (ELF, write only)",
-]
-
-SETTINGS_ORG  = "avrdude-gui"
-SETTINGS_APP  = "avrdude-gui-qt"
-KEY_THEME     = "theme"
+SETTINGS_ORG = "avrdude-gui"
+SETTINGS_APP = "avrdude-gui-qt"
+KEY_THEME    = "theme"
 
 
 class AvrdudeGUI(QMainWindow):
@@ -331,7 +311,8 @@ class AvrdudeGUI(QMainWindow):
         super().__init__()
         self.app = app
         self.setWindowTitle("avrdude GUI (PySide6)")
-        self.resize(860, 720)
+        self.resize(860, 740)
+        self.setMinimumSize(700, 600)
 
         self.avrdude_path = None
         self.conf_path    = None
@@ -353,18 +334,10 @@ class AvrdudeGUI(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
-        self.tabs = QTabWidget()
-        outer.addWidget(self.tabs)
+        # main controls (no tab widget needed any more)
+        self._build_main_panel(outer)
 
-        self.tab_main     = QWidget()
-        self.tab_terminal = QWidget()
-        self.tabs.addTab(self.tab_main,     "Program")
-        self.tabs.addTab(self.tab_terminal, "Terminal mode")
-
-        self._build_main_tab()
-        self._build_terminal_tab()
-
-        # ---- shared output box ----
+        # shared output box
         out_box = QGroupBox("Output")
         out_layout = QVBoxLayout(out_box)
         out_layout.setContentsMargins(6, 6, 6, 6)
@@ -393,48 +366,20 @@ class AvrdudeGUI(QMainWindow):
 
         outer.addWidget(out_box, stretch=1)
 
-        # ---- status bar ----
+        # status bar with theme picker
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self._build_statusbar_theme_picker()
 
-    def _build_statusbar_theme_picker(self):
-        """Embed a compact theme selector in the right side of the status bar."""
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 4, 0)
-        row.setSpacing(4)
-
-        row.addWidget(QLabel("Theme:"))
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(THEMES)
-        self.theme_combo.setFixedWidth(90)
-
-        saved = self.settings.value(KEY_THEME, THEME_SYSTEM)
-        idx = self.theme_combo.findText(saved)
-        if idx >= 0:
-            self.theme_combo.setCurrentIndex(idx)
-        apply_theme(self.app, self.theme_combo.currentText())
-
-        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
-        row.addWidget(self.theme_combo)
-
-        self.status.addPermanentWidget(container)
-
-    def _on_theme_changed(self, theme: str):
-        apply_theme(self.app, theme)
-        self.settings.setValue(KEY_THEME, theme)
-
-    # ---------------------------------------------------------------- tabs
-
-    def _build_main_tab(self):
-        layout = QGridLayout(self.tab_main)
-        layout.setContentsMargins(8, 8, 8, 8)
+    def _build_main_panel(self, outer_layout):
+        panel = QWidget()
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(4, 4, 4, 4)
         layout.setVerticalSpacing(6)
         layout.setHorizontalSpacing(6)
         r = 0
 
-        # Row 0 – programmer / part
+        # row 0: programmer / part
         layout.addWidget(QLabel("Programmer (-c):"), r, 0, Qt.AlignRight)
         self.programmer_edit = QLineEdit()
         layout.addWidget(self.programmer_edit, r, 1)
@@ -449,7 +394,7 @@ class AvrdudeGUI(QMainWindow):
         btn_part.clicked.connect(self.pick_part)
         layout.addWidget(btn_part, r, 5)
 
-        # Row 1 – port / baud
+        # row 1: port / baud
         r += 1
         layout.addWidget(QLabel("Port (-P):"), r, 0, Qt.AlignRight)
         self.port_combo = QComboBox()
@@ -462,7 +407,7 @@ class AvrdudeGUI(QMainWindow):
         self.baud_edit = QLineEdit()
         layout.addWidget(self.baud_edit, r, 4)
 
-        # Row 2 – config file
+        # row 2: config file
         r += 1
         layout.addWidget(QLabel("Config file (-C):"), r, 0, Qt.AlignRight)
         self.conf_edit = QLineEdit()
@@ -472,11 +417,18 @@ class AvrdudeGUI(QMainWindow):
         btn_conf.clicked.connect(self.browse_conf)
         layout.addWidget(btn_conf, r, 5)
 
-        # Row 3 – operation / format
+        # separator
+        r += 1
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep, r, 0, 1, 6)
+
+        # row: operation + format
         r += 1
         layout.addWidget(QLabel("Operation:"), r, 0, Qt.AlignRight)
         self.op_combo = QComboBox()
-        self.op_combo.addItems([o[0] for o in OPERATIONS])
+        self.op_combo.addItems(ALL_OP_LABELS)
+        self.op_combo.setCurrentText(OP_CONNECT)
+        self.op_combo.currentTextChanged.connect(self._on_op_change)
         layout.addWidget(self.op_combo, r, 1, 1, 2)
 
         layout.addWidget(QLabel("Format:"), r, 3, Qt.AlignRight)
@@ -484,40 +436,64 @@ class AvrdudeGUI(QMainWindow):
         self.format_combo.addItems(FORMATS)
         layout.addWidget(self.format_combo, r, 4)
 
-        # Row 4 – file
+        # row: file
         r += 1
-        layout.addWidget(QLabel("File:"), r, 0, Qt.AlignRight)
+        self.file_label = QLabel("File:")
+        layout.addWidget(self.file_label, r, 0, Qt.AlignRight)
         self.file_edit = QLineEdit()
         layout.addWidget(self.file_edit, r, 1, 1, 4)
-        btn_file = QPushButton("Browse…")
-        btn_file.clicked.connect(self.browse_file)
-        layout.addWidget(btn_file, r, 5)
+        self.file_btn = QPushButton("Browse…")
+        self.file_btn.clicked.connect(self.browse_file)
+        layout.addWidget(self.file_btn, r, 5)
 
-        # Row 5 – checkboxes
+        # row: terminal commands (shown only in terminal mode)
+        r += 1
+        self.term_label = QLabel("Commands:")
+        layout.addWidget(self.term_label, r, 0, Qt.AlignRight | Qt.AlignTop)
+        self.term_cmds = QPlainTextEdit()
+        self.term_cmds.setPlainText("sig\n")
+        self.term_cmds.setMaximumHeight(110)
+        layout.addWidget(self.term_cmds, r, 1, 1, 5)
+
+        # row: terminal hint
+        r += 1
+        self.term_hint = QLabel(TERMINAL_HINT)
+        self.term_hint.setWordWrap(True)
+        self.term_hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(self.term_hint, r, 1, 1, 5)
+
+        # separator
+        r += 1
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep2, r, 0, 1, 6)
+
+        # checkboxes + extra args
         r += 1
         self.disable_verify_check = QCheckBox("Disable auto-verify (-V)")
         layout.addWidget(self.disable_verify_check, r, 0, 1, 3)
         self.disable_erase_check = QCheckBox("Disable chip erase (-D)")
         layout.addWidget(self.disable_erase_check, r, 3, 1, 3)
 
-        # Row 6 – extra args
         r += 1
         layout.addWidget(QLabel("Extra args:"), r, 0, Qt.AlignRight)
         self.extra_edit = QLineEdit()
         self.extra_edit.setPlaceholderText("any additional avrdude flags")
         layout.addWidget(self.extra_edit, r, 1, 1, 5)
 
-        # Row 7 – command preview
+        # separator + command preview + run
+        r += 1
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep3, r, 0, 1, 6)
+
         r += 1
         layout.addWidget(QLabel("Command:"), r, 0, Qt.AlignRight)
         self.cmd_preview = QLineEdit()
         self.cmd_preview.setReadOnly(True)
         layout.addWidget(self.cmd_preview, r, 1, 1, 5)
 
-        # Row 8 – buttons
         r += 1
-        btn_row_w = QWidget()
-        btn_row = QHBoxLayout(btn_row_w)
+        btn_w = QWidget()
+        btn_row = QHBoxLayout(btn_w)
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_update = QPushButton("Update preview")
         btn_update.clicked.connect(self.update_command_preview)
@@ -527,47 +503,75 @@ class AvrdudeGUI(QMainWindow):
         btn_row.addWidget(btn_update)
         btn_row.addWidget(btn_run)
         btn_row.addStretch()
-        layout.addWidget(btn_row_w, r, 0, 1, 6)
+        layout.addWidget(btn_w, r, 0, 1, 6)
 
-        layout.setRowStretch(r + 1, 1)
         layout.setColumnStretch(1, 2)
         layout.setColumnStretch(4, 2)
 
-        # auto-update preview
+        outer_layout.addWidget(panel, stretch=0)
+
+        # auto-update preview on edits
         for w in (self.programmer_edit, self.part_edit, self.baud_edit,
                   self.conf_edit, self.file_edit, self.extra_edit):
             w.textChanged.connect(self.update_command_preview)
-        for w in (self.port_combo, self.op_combo, self.format_combo):
+        for w in (self.port_combo, self.format_combo):
             w.currentTextChanged.connect(self.update_command_preview)
         for w in (self.disable_verify_check, self.disable_erase_check):
             w.stateChanged.connect(self.update_command_preview)
 
-    def _build_terminal_tab(self):
-        layout = QVBoxLayout(self.tab_terminal)
-        layout.setContentsMargins(8, 8, 8, 8)
+        # initialise visibility
+        self._on_op_change(OP_CONNECT)
 
-        info = QLabel(
-            "Terminal mode runs <b>avrdude -t …</b> and feeds the commands "
-            "below to its interactive prompt, one per line.<br>"
-            "Common commands: <tt>sig</tt>, <tt>dump flash 0 64</tt>, "
-            "<tt>write eeprom 0 0xff</tt>, <tt>part</tt>, <tt>quit</tt>."
-        )
-        info.setWordWrap(True)
-        info.setTextFormat(Qt.RichText)
-        layout.addWidget(info)
+    def _build_statusbar_theme_picker(self):
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 4, 0)
+        row.setSpacing(4)
+        row.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(THEMES)
+        self.theme_combo.setFixedWidth(90)
+        saved = self.settings.value(KEY_THEME, THEME_SYSTEM)
+        idx = self.theme_combo.findText(saved)
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        apply_theme(self.app, self.theme_combo.currentText())
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        row.addWidget(self.theme_combo)
+        self.status.addPermanentWidget(container)
 
-        layout.addSpacing(4)
-        layout.addWidget(QLabel("Commands (one per line — 'quit' is appended automatically):"))
-        self.term_cmds = QPlainTextEdit()
-        self.term_cmds.setPlainText("sig\n")
-        self.term_cmds.setMaximumHeight(180)
-        layout.addWidget(self.term_cmds)
+    def _on_theme_changed(self, theme: str):
+        apply_theme(self.app, theme)
+        self.settings.setValue(KEY_THEME, theme)
 
-        btn_run_term = QPushButton("▶  Run terminal session")
-        btn_run_term.clicked.connect(self.run_terminal)
-        layout.addWidget(btn_run_term, alignment=Qt.AlignLeft)
+    # --------------------------------------------------------- op change
 
-        layout.addStretch()
+    def _is_terminal_mode(self):
+        return self.op_combo.currentText() == OP_TERMINAL
+
+    def _is_connect_mode(self):
+        return self.op_combo.currentText() == OP_CONNECT
+
+    def _on_op_change(self, op=None):
+        if op is None:
+            op = self.op_combo.currentText()
+
+        is_term = (op == OP_TERMINAL)
+        is_conn = (op == OP_CONNECT)
+        is_mem  = not is_term and not is_conn
+
+        # terminal widgets
+        self.term_cmds.setEnabled(is_term)
+        self.term_hint.setEnabled(is_term)
+
+        # file widgets
+        self.file_edit.setEnabled(is_mem)
+        self.file_btn.setEnabled(is_mem)
+
+        # format combo
+        self.format_combo.setEnabled(is_mem)
+
+        self.update_command_preview()
 
     # ----------------------------------------------------------------- init
 
@@ -652,7 +656,7 @@ class AvrdudeGUI(QMainWindow):
 
     # -------------------------------------------------------------- command
 
-    def build_args(self):
+    def _base_args(self):
         if not self.avrdude_path:
             raise RuntimeError("avrdude was not found. See the error shown at startup.")
 
@@ -683,26 +687,36 @@ class AvrdudeGUI(QMainWindow):
         if self.disable_erase_check.isChecked():
             args.append("-D")
 
-        op_label = self.op_combo.currentText()
-        memtype = op = None
-        for label, mem, o in OPERATIONS:
-            if label == op_label:
-                memtype, op = mem, o
-                break
-
-        fmt = (self.format_combo.currentText().split()[0]
-               if self.format_combo.currentText() else "i")
-
-        fname = self.file_edit.text().strip()
-        if memtype and op:
-            if op in ("r", "w") and not fname:
-                raise RuntimeError("Please choose a file for this operation.")
-            target = fname if fname else "-"
-            args += ["-U", f"{memtype}:{op}:{target}:{fmt}"]
-
         extra = self.extra_edit.text().strip()
         if extra:
             args += extra.split()
+
+        return args
+
+    def build_args(self):
+        args = self._base_args()
+        op   = self.op_combo.currentText()
+
+        if op == OP_CONNECT:
+            pass  # no -U, avrdude connects, reports signature, exits
+
+        elif op == OP_TERMINAL:
+            args.append("-t")
+
+        else:
+            memtype = op_char = None
+            for label, mem, o in MEM_OPERATIONS:
+                if label == op:
+                    memtype, op_char = mem, o
+                    break
+            if memtype:
+                fmt   = (self.format_combo.currentText().split()[0]
+                         if self.format_combo.currentText() else "i")
+                fname = self.file_edit.text().strip()
+                if op_char in ("r", "w") and not fname:
+                    raise RuntimeError("Please choose a file for this operation.")
+                target = fname if fname else "-"
+                args += ["-U", f"{memtype}:{op_char}:{target}:{fmt}"]
 
         return args
 
@@ -769,24 +783,17 @@ class AvrdudeGUI(QMainWindow):
             QMessageBox.critical(self, "Error", str(e))
             return
         self.update_command_preview()
-        self._start_process(args)
 
-    def run_terminal(self):
-        cmds = [c for c in self.term_cmds.toPlainText().splitlines() if c.strip()]
-        if not any(c.strip().lower() in ("q", "quit") for c in cmds):
-            cmds.append("quit")
-        stdin_text = "\n".join(cmds) + "\n"
+        stdin_text = None
+        if self._is_terminal_mode():
+            cmds = [c for c in self.term_cmds.toPlainText().splitlines()
+                    if c.strip()]
+            if not any(c.strip().lower() in ("q", "quit") for c in cmds):
+                cmds.append("quit")
+            stdin_text = "\n".join(cmds) + "\n"
+            for c in cmds:
+                self.append_output(f">>> {c}\n")
 
-        try:
-            args = self.build_args()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            return
-        if "-t" not in args:
-            args.append("-t")
-
-        for c in cmds:
-            self.append_output(f">>> {c}\n")
         self._start_process(args, stdin_text=stdin_text)
 
     def cancel_run(self):
@@ -812,7 +819,6 @@ def main():
     app = QApplication(sys.argv)
     app.setOrganizationName(SETTINGS_ORG)
     app.setApplicationName(SETTINGS_APP)
-
     win = AvrdudeGUI(app)
     win.show()
     sys.exit(app.exec())
