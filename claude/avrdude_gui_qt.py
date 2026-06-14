@@ -22,7 +22,10 @@ Binary / config location strategy:
 
 Programmer / MCU lists are obtained by running `avrdude -c ?` and
 `avrdude -p ?` against the located binary (same approach as the official
-avrdude Python GUI), then shown in a filterable picker dialog.
+avrdude Python GUI), then shown in a filterable picker dialog with
+separate ID and Description filter fields.
+
+Theme support: Light, Dark, System (auto-follow OS preference).
 """
 
 import os
@@ -31,12 +34,14 @@ import shutil
 import platform
 import subprocess
 
-from PySide6.QtCore import Qt, QProcess, QTimer
+from PySide6.QtCore import Qt, QProcess, QTimer, QSettings
+from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QLineEdit, QComboBox, QPushButton, QCheckBox, QTextEdit,
+    QLabel, QLineEdit, QComboBox, QPushButton, QCheckBox,
     QPlainTextEdit, QFileDialog, QMessageBox, QTabWidget, QGroupBox,
     QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QStatusBar,
+    QSizePolicy,
 )
 
 
@@ -114,52 +119,186 @@ def query_avrdude_list(avrdude_path, conf_path, flag):
 
 
 # --------------------------------------------------------------------------
-# Filterable picker dialog
+# Theme management
+# --------------------------------------------------------------------------
+
+THEME_SYSTEM = "System"
+THEME_LIGHT  = "Light"
+THEME_DARK   = "Dark"
+THEMES       = [THEME_SYSTEM, THEME_LIGHT, THEME_DARK]
+
+# A clean, readable dark palette
+_DARK_PALETTE = {
+    QPalette.Window:          "#2b2b2b",
+    QPalette.WindowText:      "#f0f0f0",
+    QPalette.Base:            "#1e1e1e",
+    QPalette.AlternateBase:   "#2b2b2b",
+    QPalette.ToolTipBase:     "#1e1e1e",
+    QPalette.ToolTipText:     "#f0f0f0",
+    QPalette.Text:            "#f0f0f0",
+    QPalette.Button:          "#3c3f41",
+    QPalette.ButtonText:      "#f0f0f0",
+    QPalette.BrightText:      "#ff6b6b",
+    QPalette.Link:            "#5294e2",
+    QPalette.Highlight:       "#4a90d9",
+    QPalette.HighlightedText: "#ffffff",
+    QPalette.PlaceholderText: "#888888",
+}
+
+_DARK_DISABLED = {
+    QPalette.Text:       "#666666",
+    QPalette.ButtonText: "#666666",
+    QPalette.WindowText: "#666666",
+}
+
+# A clean light palette (explicit so switching back from dark is clean)
+_LIGHT_PALETTE = {
+    QPalette.Window:          "#f0f0f0",
+    QPalette.WindowText:      "#1a1a1a",
+    QPalette.Base:            "#ffffff",
+    QPalette.AlternateBase:   "#f7f7f7",
+    QPalette.ToolTipBase:     "#ffffdc",
+    QPalette.ToolTipText:     "#1a1a1a",
+    QPalette.Text:            "#1a1a1a",
+    QPalette.Button:          "#e0e0e0",
+    QPalette.ButtonText:      "#1a1a1a",
+    QPalette.BrightText:      "#cc0000",
+    QPalette.Link:            "#0057ae",
+    QPalette.Highlight:       "#308cc6",
+    QPalette.HighlightedText: "#ffffff",
+    QPalette.PlaceholderText: "#999999",
+}
+
+_LIGHT_DISABLED = {
+    QPalette.Text:       "#a0a0a0",
+    QPalette.ButtonText: "#a0a0a0",
+    QPalette.WindowText: "#a0a0a0",
+}
+
+
+def _build_palette(color_map, disabled_map):
+    pal = QPalette()
+    for role, color in color_map.items():
+        pal.setColor(QPalette.Active,   role, QColor(color))
+        pal.setColor(QPalette.Inactive, role, QColor(color))
+    for role, color in disabled_map.items():
+        pal.setColor(QPalette.Disabled, role, QColor(color))
+    return pal
+
+
+def apply_theme(app: QApplication, theme: str):
+    """Apply Light / Dark / System theme to the QApplication."""
+    app.setStyle("Fusion")          # Fusion renders palettes faithfully on all OS
+    if theme == THEME_DARK:
+        app.setPalette(_build_palette(_DARK_PALETTE, _DARK_DISABLED))
+        app.setStyleSheet(
+            "QToolTip { color: #f0f0f0; background-color: #1e1e1e; "
+            "border: 1px solid #555; }"
+        )
+    elif theme == THEME_LIGHT:
+        app.setPalette(_build_palette(_LIGHT_PALETTE, _LIGHT_DISABLED))
+        app.setStyleSheet("")
+    else:  # System
+        app.setPalette(app.style().standardPalette())
+        app.setStyleSheet("")
+
+
+# --------------------------------------------------------------------------
+# Filterable picker dialog  (separate ID + Description filter fields)
 # --------------------------------------------------------------------------
 
 class PickerDialog(QDialog):
+    """
+    Shows a two-column (ID / Description) list with *two* independent filter
+    boxes so the user can narrow by ID alone, description alone, or both at
+    once.
+    """
+
     def __init__(self, parent, title, items):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 440)
+        self.resize(600, 480)
         self.items = items
         self.result_value = None
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("Filter:"))
-        self.filter_edit = QLineEdit()
-        self.filter_edit.textChanged.connect(self.refresh)
-        layout.addWidget(self.filter_edit)
+        # ---- dual filter row ----
+        filter_row = QHBoxLayout()
 
+        filter_row.addWidget(QLabel("Filter ID:"))
+        self.filter_id = QLineEdit()
+        self.filter_id.setPlaceholderText("e.g.  arduino")
+        self.filter_id.textChanged.connect(self._refresh)
+        filter_row.addWidget(self.filter_id, 1)
+
+        filter_row.addSpacing(12)
+
+        filter_row.addWidget(QLabel("Filter description:"))
+        self.filter_desc = QLineEdit()
+        self.filter_desc.setPlaceholderText("e.g.  Uno")
+        self.filter_desc.textChanged.connect(self._refresh)
+        filter_row.addWidget(self.filter_desc, 2)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setFixedWidth(54)
+        btn_clear.clicked.connect(self._clear_filters)
+        filter_row.addWidget(btn_clear)
+
+        layout.addLayout(filter_row)
+
+        # ---- result count label ----
+        self.count_label = QLabel()
+        layout.addWidget(self.count_label)
+
+        # ---- tree ----
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels(["ID", "Description"])
-        self.tree.setColumnWidth(0, 160)
-        self.tree.itemDoubleClicked.connect(self.accept)
+        self.tree.setColumnWidth(0, 170)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(0, Qt.AscendingOrder)
+        self.tree.itemDoubleClicked.connect(self._accept_current)
         layout.addWidget(self.tree)
 
+        # ---- buttons ----
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept_current)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self.refresh()
-        self.filter_edit.setFocus()
+        self._refresh()
+        self.filter_id.setFocus()
 
-    def refresh(self):
-        f = self.filter_edit.text().strip().lower()
+    def _clear_filters(self):
+        self.filter_id.clear()
+        self.filter_desc.clear()
+        self.filter_id.setFocus()
+
+    def _refresh(self):
+        fi = self.filter_id.text().strip().lower()
+        fd = self.filter_desc.text().strip().lower()
+
         self.tree.clear()
+        count = 0
         for ident, desc in self.items:
-            if f and f not in ident.lower() and f not in desc.lower():
+            if fi and fi not in ident.lower():
+                continue
+            if fd and fd not in desc.lower():
                 continue
             QTreeWidgetItem(self.tree, [ident, desc])
+            count += 1
 
-    def accept(self):
+        total = len(self.items)
+        self.count_label.setText(
+            f"{count} of {total} entries" if (fi or fd) else f"{total} entries"
+        )
+
+    def _accept_current(self):
         item = self.tree.currentItem()
         if item:
             self.result_value = item.text(0)
-        super().accept()
+            self.accept()
 
 
 # --------------------------------------------------------------------------
@@ -175,21 +314,32 @@ OPERATIONS = [
     ("Verify EEPROM",          "eeprom", "v"),
 ]
 
-FORMATS = ["i (Intel Hex)", "r (raw binary)", "s (Motorola S-record)",
-           "e (ELF, write only)"]
+FORMATS = [
+    "i (Intel Hex)",
+    "r (raw binary)",
+    "s (Motorola S-record)",
+    "e (ELF, write only)",
+]
+
+SETTINGS_ORG  = "avrdude-gui"
+SETTINGS_APP  = "avrdude-gui-qt"
+KEY_THEME     = "theme"
 
 
 class AvrdudeGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, app: QApplication):
         super().__init__()
+        self.app = app
         self.setWindowTitle("avrdude GUI (PySide6)")
-        self.resize(840, 700)
+        self.resize(860, 720)
 
         self.avrdude_path = None
-        self.conf_path = None
-        self.programmers = []
-        self.parts = []
-        self.process = None
+        self.conf_path    = None
+        self.programmers  = []
+        self.parts        = []
+        self.process      = None
+
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         self._build_ui()
         self._locate_avrdude()
@@ -200,25 +350,30 @@ class AvrdudeGUI(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
 
         self.tabs = QTabWidget()
         outer.addWidget(self.tabs)
 
-        self.tab_main = QWidget()
+        self.tab_main     = QWidget()
         self.tab_terminal = QWidget()
-        self.tabs.addTab(self.tab_main, "Program")
+        self.tabs.addTab(self.tab_main,     "Program")
         self.tabs.addTab(self.tab_terminal, "Terminal mode")
 
         self._build_main_tab()
         self._build_terminal_tab()
 
-        # Output box (shared)
+        # ---- shared output box ----
         out_box = QGroupBox("Output")
         out_layout = QVBoxLayout(out_box)
+        out_layout.setContentsMargins(6, 6, 6, 6)
+
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         font = self.output.font()
         font.setFamily("Consolas" if platform.system() == "Windows" else "Menlo")
+        font.setPointSize(10)
         self.output.setFont(font)
         out_layout.addWidget(self.output)
 
@@ -236,97 +391,149 @@ class AvrdudeGUI(QMainWindow):
         btn_row.addWidget(self.btn_cancel)
         out_layout.addLayout(btn_row)
 
-        outer.addWidget(out_box)
+        outer.addWidget(out_box, stretch=1)
 
+        # ---- status bar ----
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self._build_statusbar_theme_picker()
+
+    def _build_statusbar_theme_picker(self):
+        """Embed a compact theme selector in the right side of the status bar."""
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 4, 0)
+        row.setSpacing(4)
+
+        row.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(THEMES)
+        self.theme_combo.setFixedWidth(90)
+
+        saved = self.settings.value(KEY_THEME, THEME_SYSTEM)
+        idx = self.theme_combo.findText(saved)
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        apply_theme(self.app, self.theme_combo.currentText())
+
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        row.addWidget(self.theme_combo)
+
+        self.status.addPermanentWidget(container)
+
+    def _on_theme_changed(self, theme: str):
+        apply_theme(self.app, theme)
+        self.settings.setValue(KEY_THEME, theme)
+
+    # ---------------------------------------------------------------- tabs
 
     def _build_main_tab(self):
         layout = QGridLayout(self.tab_main)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setVerticalSpacing(6)
+        layout.setHorizontalSpacing(6)
         r = 0
 
-        layout.addWidget(QLabel("Programmer (-c):"), r, 0)
+        # Row 0 – programmer / part
+        layout.addWidget(QLabel("Programmer (-c):"), r, 0, Qt.AlignRight)
         self.programmer_edit = QLineEdit()
         layout.addWidget(self.programmer_edit, r, 1)
-        btn_prog = QPushButton("Select...")
+        btn_prog = QPushButton("Select…")
         btn_prog.clicked.connect(self.pick_programmer)
         layout.addWidget(btn_prog, r, 2)
 
-        layout.addWidget(QLabel("MCU (-p):"), r, 3)
+        layout.addWidget(QLabel("MCU (-p):"), r, 3, Qt.AlignRight)
         self.part_edit = QLineEdit()
         layout.addWidget(self.part_edit, r, 4)
-        btn_part = QPushButton("Select...")
+        btn_part = QPushButton("Select…")
         btn_part.clicked.connect(self.pick_part)
         layout.addWidget(btn_part, r, 5)
 
+        # Row 1 – port / baud
         r += 1
-        layout.addWidget(QLabel("Port (-P):"), r, 0)
+        layout.addWidget(QLabel("Port (-P):"), r, 0, Qt.AlignRight)
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
         self.port_combo.addItems(self._guess_ports())
         self.port_combo.setCurrentText("usb")
         layout.addWidget(self.port_combo, r, 1)
 
-        layout.addWidget(QLabel("Baud (-b):"), r, 3)
+        layout.addWidget(QLabel("Baud (-b):"), r, 3, Qt.AlignRight)
         self.baud_edit = QLineEdit()
         layout.addWidget(self.baud_edit, r, 4)
 
+        # Row 2 – config file
         r += 1
-        layout.addWidget(QLabel("Config file (-C, optional):"), r, 0)
+        layout.addWidget(QLabel("Config file (-C):"), r, 0, Qt.AlignRight)
         self.conf_edit = QLineEdit()
+        self.conf_edit.setPlaceholderText("optional – leave blank to use avrdude default")
         layout.addWidget(self.conf_edit, r, 1, 1, 4)
-        btn_conf = QPushButton("Browse...")
+        btn_conf = QPushButton("Browse…")
         btn_conf.clicked.connect(self.browse_conf)
         layout.addWidget(btn_conf, r, 5)
 
+        # Row 3 – operation / format
         r += 1
-        layout.addWidget(QLabel("Operation:"), r, 0)
+        layout.addWidget(QLabel("Operation:"), r, 0, Qt.AlignRight)
         self.op_combo = QComboBox()
         self.op_combo.addItems([o[0] for o in OPERATIONS])
         layout.addWidget(self.op_combo, r, 1, 1, 2)
 
-        layout.addWidget(QLabel("Format (-i/o):"), r, 3)
+        layout.addWidget(QLabel("Format:"), r, 3, Qt.AlignRight)
         self.format_combo = QComboBox()
         self.format_combo.addItems(FORMATS)
         layout.addWidget(self.format_combo, r, 4)
 
+        # Row 4 – file
         r += 1
-        layout.addWidget(QLabel("File:"), r, 0)
+        layout.addWidget(QLabel("File:"), r, 0, Qt.AlignRight)
         self.file_edit = QLineEdit()
         layout.addWidget(self.file_edit, r, 1, 1, 4)
-        btn_file = QPushButton("Browse...")
+        btn_file = QPushButton("Browse…")
         btn_file.clicked.connect(self.browse_file)
         layout.addWidget(btn_file, r, 5)
 
+        # Row 5 – checkboxes
         r += 1
         self.disable_verify_check = QCheckBox("Disable auto-verify (-V)")
-        layout.addWidget(self.disable_verify_check, r, 0, 1, 2)
+        layout.addWidget(self.disable_verify_check, r, 0, 1, 3)
         self.disable_erase_check = QCheckBox("Disable chip erase (-D)")
-        layout.addWidget(self.disable_erase_check, r, 2, 1, 2)
+        layout.addWidget(self.disable_erase_check, r, 3, 1, 3)
 
+        # Row 6 – extra args
         r += 1
-        layout.addWidget(QLabel("Extra args:"), r, 0)
+        layout.addWidget(QLabel("Extra args:"), r, 0, Qt.AlignRight)
         self.extra_edit = QLineEdit()
+        self.extra_edit.setPlaceholderText("any additional avrdude flags")
         layout.addWidget(self.extra_edit, r, 1, 1, 5)
 
+        # Row 7 – command preview
         r += 1
-        layout.addWidget(QLabel("Command:"), r, 0)
+        layout.addWidget(QLabel("Command:"), r, 0, Qt.AlignRight)
         self.cmd_preview = QLineEdit()
         self.cmd_preview.setReadOnly(True)
         layout.addWidget(self.cmd_preview, r, 1, 1, 5)
 
+        # Row 8 – buttons
         r += 1
-        btn_row = QHBoxLayout()
-        btn_update = QPushButton("Update command preview")
+        btn_row_w = QWidget()
+        btn_row = QHBoxLayout(btn_row_w)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_update = QPushButton("Update preview")
         btn_update.clicked.connect(self.update_command_preview)
-        btn_run = QPushButton("Run")
+        btn_run = QPushButton("▶  Run")
+        btn_run.setDefault(True)
         btn_run.clicked.connect(self.run_avrdude)
         btn_row.addWidget(btn_update)
         btn_row.addWidget(btn_run)
         btn_row.addStretch()
-        layout.addLayout(btn_row, r, 0, 1, 6)
+        layout.addWidget(btn_row_w, r, 0, 1, 6)
 
-        # auto-update preview on edits
+        layout.setRowStretch(r + 1, 1)
+        layout.setColumnStretch(1, 2)
+        layout.setColumnStretch(4, 2)
+
+        # auto-update preview
         for w in (self.programmer_edit, self.part_edit, self.baud_edit,
                   self.conf_edit, self.file_edit, self.extra_edit):
             w.textChanged.connect(self.update_command_preview)
@@ -335,26 +542,28 @@ class AvrdudeGUI(QMainWindow):
         for w in (self.disable_verify_check, self.disable_erase_check):
             w.stateChanged.connect(self.update_command_preview)
 
-        layout.setRowStretch(r + 1, 1)
-
     def _build_terminal_tab(self):
         layout = QVBoxLayout(self.tab_terminal)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         info = QLabel(
-            "Terminal mode runs `avrdude -t ...` and sends the commands below "
-            "to its interactive prompt (one per line). Common commands: "
-            "d/dump, w/write, p/part, sig, q/quit."
+            "Terminal mode runs <b>avrdude -t …</b> and feeds the commands "
+            "below to its interactive prompt, one per line.<br>"
+            "Common commands: <tt>sig</tt>, <tt>dump flash 0 64</tt>, "
+            "<tt>write eeprom 0 0xff</tt>, <tt>part</tt>, <tt>quit</tt>."
         )
         info.setWordWrap(True)
+        info.setTextFormat(Qt.RichText)
         layout.addWidget(info)
 
-        layout.addWidget(QLabel("Commands (one per line, 'quit' is appended automatically):"))
+        layout.addSpacing(4)
+        layout.addWidget(QLabel("Commands (one per line — 'quit' is appended automatically):"))
         self.term_cmds = QPlainTextEdit()
         self.term_cmds.setPlainText("sig\n")
-        self.term_cmds.setMaximumHeight(160)
+        self.term_cmds.setMaximumHeight(180)
         layout.addWidget(self.term_cmds)
 
-        btn_run_term = QPushButton("Run terminal session")
+        btn_run_term = QPushButton("▶  Run terminal session")
         btn_run_term.clicked.connect(self.run_terminal)
         layout.addWidget(btn_run_term, alignment=Qt.AlignLeft)
 
@@ -389,21 +598,19 @@ class AvrdudeGUI(QMainWindow):
             self.status.showMessage("avrdude not found")
             return
         self.avrdude_path = path
-        self.conf_path = conf
+        self.conf_path    = conf
         if conf:
             self.conf_edit.setText(conf)
         self.status.showMessage(f"avrdude: {path}")
-
-        # Defer list-loading slightly so the window shows first
-        QTimer.singleShot(50, self._load_lists)
+        QTimer.singleShot(60, self._load_lists)
 
     def _load_lists(self):
-        progs, _ = query_avrdude_list(self.avrdude_path, self.conf_path_value(), "-c")
-        parts, _ = query_avrdude_list(self.avrdude_path, self.conf_path_value(), "-p")
+        progs, _ = query_avrdude_list(self.avrdude_path, self._conf_value(), "-c")
+        parts, _ = query_avrdude_list(self.avrdude_path, self._conf_value(), "-p")
         self.programmers = sorted(progs)
-        self.parts = sorted(parts)
+        self.parts       = sorted(parts)
 
-    def conf_path_value(self):
+    def _conf_value(self):
         v = self.conf_edit.text().strip()
         return v if v else self.conf_path
 
@@ -412,7 +619,7 @@ class AvrdudeGUI(QMainWindow):
     def pick_programmer(self):
         if not self.programmers:
             QMessageBox.information(self, "Please wait",
-                                     "Programmer list is still loading, or avrdude could not be queried.")
+                "Programmer list is still loading, or avrdude could not be queried.")
             return
         dlg = PickerDialog(self, "Select programmer", self.programmers)
         if dlg.exec() == QDialog.Accepted and dlg.result_value:
@@ -421,23 +628,25 @@ class AvrdudeGUI(QMainWindow):
     def pick_part(self):
         if not self.parts:
             QMessageBox.information(self, "Please wait",
-                                     "Part list is still loading, or avrdude could not be queried.")
+                "Part list is still loading, or avrdude could not be queried.")
             return
-        dlg = PickerDialog(self, "Select MCU", self.parts)
+        dlg = PickerDialog(self, "Select MCU / part", self.parts)
         if dlg.exec() == QDialog.Accepted and dlg.result_value:
             self.part_edit.setText(dlg.result_value)
 
     def browse_file(self):
         if "Write" in self.op_combo.currentText():
-            f, _ = QFileDialog.getOpenFileName(self, "Select file")
+            f, _ = QFileDialog.getOpenFileName(self, "Select input file")
         else:
-            f, _ = QFileDialog.getSaveFileName(self, "Select file")
+            f, _ = QFileDialog.getSaveFileName(self, "Select output file")
         if f:
             self.file_edit.setText(f)
 
     def browse_conf(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Select avrdude.conf",
-                                            filter="avrdude.conf;;All files (*)")
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Select avrdude.conf",
+            filter="avrdude config (avrdude.conf);;All files (*)"
+        )
         if f:
             self.conf_edit.setText(f)
 
@@ -475,14 +684,14 @@ class AvrdudeGUI(QMainWindow):
             args.append("-D")
 
         op_label = self.op_combo.currentText()
-        memtype, op = None, None
+        memtype = op = None
         for label, mem, o in OPERATIONS:
             if label == op_label:
                 memtype, op = mem, o
                 break
 
-        fmt_full = self.format_combo.currentText()
-        fmt = fmt_full.split()[0] if fmt_full else "i"
+        fmt = (self.format_combo.currentText().split()[0]
+               if self.format_combo.currentText() else "i")
 
         fname = self.file_edit.text().strip()
         if memtype and op:
@@ -506,9 +715,7 @@ class AvrdudeGUI(QMainWindow):
 
     @staticmethod
     def _quote(s):
-        if " " in s or s == "":
-            return f'"{s}"'
-        return s
+        return f'"{s}"' if (" " in s or s == "") else s
 
     # -------------------------------------------------------------- running
 
@@ -518,17 +725,16 @@ class AvrdudeGUI(QMainWindow):
             return
 
         self.append_output(f"$ {' '.join(args)}\n")
-        self.status.showMessage("Running...")
+        self.status.showMessage("Running…")
         self.btn_cancel.setEnabled(True)
 
         proc = QProcess(self)
         proc.setProgram(args[0])
         proc.setArguments(args[1:])
         proc.setProcessChannelMode(QProcess.MergedChannels)
-
         proc.readyReadStandardOutput.connect(lambda: self._on_ready(proc))
-        proc.finished.connect(lambda code, status: self._on_finished(code, status))
-        proc.errorOccurred.connect(lambda err: self._on_error(err))
+        proc.finished.connect(self._on_finished)
+        proc.errorOccurred.connect(self._on_error)
 
         self.process = proc
         proc.start()
@@ -598,9 +804,16 @@ class AvrdudeGUI(QMainWindow):
         QApplication.clipboard().setText(self.output.toPlainText())
 
 
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
 def main():
     app = QApplication(sys.argv)
-    win = AvrdudeGUI()
+    app.setOrganizationName(SETTINGS_ORG)
+    app.setApplicationName(SETTINGS_APP)
+
+    win = AvrdudeGUI(app)
     win.show()
     sys.exit(app.exec())
 

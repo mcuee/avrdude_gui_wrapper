@@ -144,8 +144,13 @@ def query_avrdude_list(avrdude_path, conf_path, flag):
 # --------------------------------------------------------------------------
 
 class PickerDialog(tk.Toplevel):
-    """A simple modal dialog with a search box and a filterable list of
-    (id, description) pairs."""
+    """
+    Modal picker with *two* independent filter fields:
+      • Filter ID          – matches against the short identifier
+      • Filter description – matches against the long description
+    Both filters are applied simultaneously (AND logic).
+    Double-clicking a row, or pressing Enter / clicking OK, selects it.
+    """
 
     def __init__(self, parent, title, items):
         super().__init__(parent)
@@ -153,44 +158,103 @@ class PickerDialog(tk.Toplevel):
         self.result = None
         self.items = items
 
-        self.geometry("520x420")
+        self.geometry("600x460")
+        self.minsize(480, 340)
         self.transient(parent)
         self.grab_set()
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="Filter:").pack(anchor="w")
-        self.filter_var = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=self.filter_var)
-        entry.pack(fill="x", pady=(0, 6))
-        entry.bind("<KeyRelease>", lambda e: self.refresh())
-        entry.focus_set()
+        # ---- dual filter row ----
+        filter_frame = ttk.Frame(top)
+        filter_frame.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_frame, text="Filter ID:").pack(side="left")
+        self.filter_id_var = tk.StringVar()
+        id_entry = ttk.Entry(filter_frame, textvariable=self.filter_id_var, width=18)
+        id_entry.pack(side="left", padx=(2, 10))
+        id_entry.bind("<KeyRelease>", lambda e: self._refresh())
+
+        ttk.Label(filter_frame, text="Filter description:").pack(side="left")
+        self.filter_desc_var = tk.StringVar()
+        desc_entry = ttk.Entry(filter_frame, textvariable=self.filter_desc_var, width=28)
+        desc_entry.pack(side="left", padx=(2, 10))
+        desc_entry.bind("<KeyRelease>", lambda e: self._refresh())
+
+        btn_clear = ttk.Button(filter_frame, text="Clear", width=6,
+                               command=self._clear_filters)
+        btn_clear.pack(side="left")
+
+        # ---- result count ----
+        self.count_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.count_var, foreground="gray").pack(anchor="w")
+
+        # ---- tree ----
+        tree_frame = ttk.Frame(top)
+        tree_frame.pack(fill="both", expand=True, pady=(2, 0))
 
         cols = ("id", "description")
-        self.tree = ttk.Treeview(top, columns=cols, show="headings",
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                   selectmode="browse")
-        self.tree.heading("id", text="ID")
-        self.tree.heading("description", text="Description")
-        self.tree.column("id", width=140, anchor="w")
-        self.tree.column("description", width=340, anchor="w")
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Double-1>", lambda e: self.on_ok())
+        self.tree.heading("id", text="ID",
+                          command=lambda: self._sort_col("id", False))
+        self.tree.heading("description", text="Description",
+                          command=lambda: self._sort_col("description", False))
+        self.tree.column("id", width=160, anchor="w")
+        self.tree.column("description", width=380, anchor="w")
 
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.tree.bind("<Double-1>", lambda e: self.on_ok())
+        self.tree.bind("<Return>",   lambda e: self.on_ok())
+
+        # ---- buttons ----
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=(8, 0))
-        ttk.Button(btns, text="OK", command=self.on_ok).pack(side="right")
+        ttk.Button(btns, text="OK",     command=self.on_ok).pack(side="right")
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
 
-        self.refresh()
+        self._refresh()
+        id_entry.focus_set()
 
-    def refresh(self):
-        f = self.filter_var.get().strip().lower()
+    # ---------------------------------------------------------------- helpers
+
+    def _clear_filters(self):
+        self.filter_id_var.set("")
+        self.filter_desc_var.set("")
+        self._refresh()
+
+    def _refresh(self):
+        fi = self.filter_id_var.get().strip().lower()
+        fd = self.filter_desc_var.get().strip().lower()
+
         self.tree.delete(*self.tree.get_children())
+        count = 0
         for ident, desc in self.items:
-            if f and f not in ident.lower() and f not in desc.lower():
+            if fi and fi not in ident.lower():
+                continue
+            if fd and fd not in desc.lower():
                 continue
             self.tree.insert("", "end", values=(ident, desc))
+            count += 1
+
+        total = len(self.items)
+        if fi or fd:
+            self.count_var.set(f"{count} of {total} entries shown")
+        else:
+            self.count_var.set(f"{total} entries")
+
+    def _sort_col(self, col, reverse):
+        """Sort tree by column header click."""
+        data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        data.sort(reverse=reverse)
+        for index, (_, k) in enumerate(data):
+            self.tree.move(k, "", index)
+        self.tree.heading(col, command=lambda: self._sort_col(col, not reverse))
 
     def on_ok(self):
         sel = self.tree.selection()
