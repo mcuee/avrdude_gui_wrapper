@@ -1,6 +1,8 @@
 # avrdude_gui_wrapper
 GUI wraper for avrdude CLI using Python and C++
 
+Take note avrdude project is licensed under GPL 2.0.
+
 Two versions.
 1) tkinter version
 2) PySide6 version
